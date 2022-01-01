@@ -1,11 +1,18 @@
+from math import gamma
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules.container import Sequential
 import torch.optim as optim
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 import numpy as np
 from utility import linear_annealing, exponential_annealing
+from torch.utils.tensorboard import SummaryWriter
+from config import *
 
+
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+print(f"{DEVICE = }")
 
 class PolicyNetwork(nn.Module):
     def __init__(self, num_states, num_actions):
@@ -24,11 +31,25 @@ class PolicyNetwork(nn.Module):
         """
         # self.layer1 = None
         
-        in_features = 4     # in_features: snake_index, snake_dir, apple_index, GRID_DIMS
-        out_features = 4    # out_features: up, left, down, right
-        self.layer1 = nn.Linear(in_features, 32)        # hidden layer 1
+        self.layer1 = nn.Linear(num_states, 32)         # hidden layer 1
         self.layer2 = nn.Linear(32, 128)                # hidden layer 2
-        self.layer_out = nn.Linear(128, out_features)   # output
+        self.layer_out = nn.Linear(128, num_actions)    # output
+
+        # self.layer1 = nn.Sequential(
+        #     nn.Conv2d(1, 16, 3),
+        #     nn.ReLU(),
+        #     # nn.MaxPool2d(kernel_size=2, stride=2)
+        # )
+        # self.layer2 = nn.Sequential(
+        #     nn.Conv2d(16, 64, 3),
+        #     nn.ReLU(),
+        #     # nn.MaxPool2d(kernel_size=2, stride=2)
+        # )
+        # out_dim = GRID_DIMS-2
+        # self.layer_out = nn.Sequential(
+        #     nn.Linear(out_dim * out_dim * 64, num_actions),
+        #     nn.ReLU()
+        # )
 
 
     def forward(self, x):
@@ -42,8 +63,13 @@ class PolicyNetwork(nn.Module):
         """
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
-        # x = F.relu(self.layer_out(x))
-        x = F.leaky_relu(self.layer_out(x), negative_slope=0.01)
+        x = self.layer_out(x)
+
+        # x = self.layer1(x)
+        # x = self.layer2(x)
+        # x = x.view(x.size(0), -1)  # Flatten for FUlly Connected layer
+        # x = self.layer_out(x)
+        
         return x
 
 
@@ -62,6 +88,10 @@ class DQN:
 
         self.target_net = PolicyNetwork(self.num_states, self.num_actions)
         self.act_net = PolicyNetwork(self.num_states, self.num_actions)
+        # self.target_net = PolicyNetwork(self.num_states, self.num_actions).cuda()
+        # self.act_net = PolicyNetwork(self.num_states, self.num_actions).cuda()
+        # self.target_net = PolicyNetwork(self.num_states, self.num_actions).to(DEVICE)
+        # self.act_net = PolicyNetwork(self.num_states, self.num_actions).to(DEVICE)
         self.memory = [None] * self.capacity
 
         # The epsilon value for e-greedy action selection
@@ -73,13 +103,22 @@ class DQN:
             self.epsilon = linear_annealing(
                 self.e,
                 0.1,
-                HYPERPARAMETERS["number_of_steps"]
+                # HYPERPARAMETERS["number_of_steps"]
+                HYPERPARAMETERS["number_of_steps"] * 2/3
             )
         else:
+            numsteps_str = str(int(HYPERPARAMETERS["number_of_steps"]))
+            num_digits = len(numsteps_str)
+            factor = int(numsteps_str[0])
+            if factor == 1: 
+                factor = 10
+            # DECAY_RATIO = 1 - (factor * 10**-num_digits)
+            DECAY_RATIO = HYPERPARAMETERS["decay"]
             self.epsilon = exponential_annealing(
                 self.e,
                 0.1,
-                HYPERPARAMETERS["number_of_steps"]
+                # HYPERPARAMETERS["number_of_steps"]
+                DECAY_RATIO
             )
 
         # We will use Adam optimizer here
@@ -87,14 +126,27 @@ class DQN:
                                     self.learning_rate)
         # Mean-squared error will be enough for this project
         self.loss_func = nn.MSELoss()
+        # self.writer = SummaryWriter()
+        self.update_steps = 0
 
     def select_action(self, state):
         # To select an action, we need to feed it to Neural Net
         # NN only accepts tensors, so we need to convert the state
+        self.e = next(self.epsilon)
+        if np.random.random() < self.e:
+            # print(f"random action ({eps = })")
+            return np.random.randint(0, self.num_actions)
+        state = torch.tensor(state, dtype=torch.float32)
+        state = state.unsqueeze(0).unsqueeze(0)
+        # state = torch.tensor(state, dtype=torch.float32).cuda()
+        # state = torch.tensor(state, dtype=torch.float32).to(DEVICE)
+        res = self.act_net.forward(state)
+        # print(f"{res = } {res.sum() = } ||| {torch.argmax(res) = }")
+        return torch.argmax(res)
         
         # Here, the exploitation-exploration balance is handled
         # We get the next epsilon value based on the current step amount
-        raise NotImplementedError("You should write a function for action selection")
+        # raise NotImplementedError("You should write a function for action selection")
 
     def store_transition(self, transition):
         index = self.memory_count % self.capacity
@@ -109,22 +161,32 @@ class DQN:
 
     def update(self):
         if self.memory_count >= self.capacity:
+            self.update_steps += 1
             # Read state, action, reward, next_state from mem
-            state, action, reward, next_state = [], [], [], []
+            states, actions, rewards, next_states = [], [], [], []
             for t in self.memory:
-                state.append(t.state)
-                action.append(t.action)
-                reward.append(t.reward)
-                next_state.append(t.next_state)
+                states.append(t.state)
+                actions.append(t.action)
+                rewards.append(t.reward)
+                next_states.append(t.next_state)
 
-            state = torch.tensor(state).float()
-            action = torch.LongTensor(action).view(-1, 1).long()
-            reward = torch.tensor(reward).float()
-            next_state = torch.tensor(next_state).float()
+            states = torch.tensor(states).float()
+            actions = torch.LongTensor(actions).view(-1, 1).long()
+            rewards = torch.tensor(rewards).float()
+            next_states = torch.tensor(next_states).float()
+            # states = torch.tensor(states).float().cuda()
+            # actions = torch.LongTensor(actions).view(-1, 1).long().cuda()
+            # rewards = torch.tensor(rewards).float().cuda()
+            # next_states = torch.tensor(next_states).float().cuda()
+            # states = torch.tensor(states).float().to(DEVICE)
+            # actions = torch.LongTensor(actions).view(-1, 1).long().to(DEVICE)
+            # rewards = torch.tensor(rewards).float().to(DEVICE)
+            # next_states = torch.tensor(next_states).float().to(DEVICE)
+            
             # The view method reshapes the tensor without any copy
             # operation. It is super fast and efficient
 
-            reward = (reward - reward.mean()) / (reward.std() + 1e-7)
+            rewards = (rewards - rewards.mean()) / (rewards+ 1e-7)
             # Take a look at this reward calculation. We have a tensor
             # (1D vector) of rewards, we are calculating mean and std
             # of this tensor, and subtract mean from all elements.
@@ -139,8 +201,14 @@ class DQN:
 
             # Update...
             # Get a set of random indices to fetch them in memory
-            for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), batch_size=self.batch_size,
-                                      drop_last=False):
+            for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), 
+                                        batch_size=self.batch_size,
+                                        drop_last=False):
+                # print(f"darari: {index}", end="|", flush=True)
+                
+                # print(states, states.shape)
+                # print(states[index], states[index].shape)
+
                 # Get the current Q values
                 # Notice we are using active network and
                 # calculating gradients.
@@ -151,8 +219,40 @@ class DQN:
                 # Then step
               
                 # Update the target network every once in a while
-                raise NotImplementedError
+                # raise NotImplementedError
+
+
+                s_batch = states[index]
+                a_batch = actions[index]
+                r_batch = rewards[index]
+                ns_batch = next_states[index]
+                ## (Lecture 13) MIT DeepLearning L5, slide 31:
+                ## L = E[ ||target_Q - predicted_Q||^2 ]
+                ## target_Q = r + gamma * next state max Q values | predicted = (state,action) Q values
+                ## target_Q: Bellman equation
+                predicted = self.act_net(s_batch).gather(1, a_batch).squeeze() # calculate Q values 
+                # print(f"{predicted.shape = }")
+                # print(action.shape, action.unsqueeze(-1).shape)
+                next_state_max_Qs, _ = self.target_net(ns_batch).max(1)  # _ : maximizing actions
+                next_state_max_Qs = next_state_max_Qs.detach()
+                # print(f"{next_state_max_Qs.shape = }")
+                target = r_batch + self.gamma * next_state_max_Qs
+                # print(f"{target.shape = }")
+                self.loss = self.loss_func(target, predicted)
+                self.optimizer.zero_grad()
+                self.loss.backward()
+                self.optimizer.step()
+                break
+
+            
+            if self.update_steps % 100 == 0: # Update the target network every once in a while
+                self.target_net.load_state_dict(self.act_net.state_dict())
+                
+            # print()
+            return True     # updated
 
 
         else:
-            print("Memory Buffer is too small")
+            if self.memory_count % 100 == 0:
+                print(f"Memory Buffer is too small ({self.memory_count})")
+            return False     # not updated

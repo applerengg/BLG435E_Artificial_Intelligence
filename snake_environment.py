@@ -50,6 +50,18 @@ def convert_direction_to_action(direction):
     elif direction == 'R':
         return 3
 
+def convert_vector_to_action(vector):
+    if vector == (-1, 0): # 'U'
+        return 0
+    elif vector == (0, -1): # 'L':
+        return 1
+    elif vector == (1, 0): # 'D':
+        return 2
+    elif vector == (0, 1): # 'R':
+        return 3
+    else:
+        return -1
+
 def generate_level():
     level_matrix = []
     for i in range(GRID_DIMS + 2):
@@ -180,6 +192,7 @@ class Snake(gym.Env):
 
     def collect_apple(self):
         self.apple_count += 1
+        self.steps_since_apple = 0
 
         apple_slots = get_empty_tiles(self.level_matrix)
         if len(apple_slots) == 0:
@@ -240,6 +253,7 @@ class Snake(gym.Env):
         """
         self.elapsed_steps += 1
         self.total_elapsed_steps += 1
+        self.steps_since_apple += 1
         self.hit_the_wall = False
         self.ate_apple = False
         directional_action = convert_action_to_direction(action)
